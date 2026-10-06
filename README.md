@@ -1,107 +1,71 @@
-# Lease 分布式锁模拟器（完全本地）
+# tilepyramid — 本地图像金字塔与切片生成工具
 
-一个纯本地的 Lease 分布式锁模拟器：多客户端由同一进程内的线程模拟，锁状态、
-fencing token 与操作日志只保存在**本地文件或内存**中，不依赖 Redis、etcd、
-ZooKeeper 或任何外部服务。
+纯本地实现：输入图片、缩放层、tile、manifest 与缓存只存在于本地文件或内存中，
+不依赖地图服务器、CDN、云存储或任何外部服务。支持读取常见 PNG / JPEG。
 
-## 功能
+## 安装与依赖
 
-- `acquire` / `renew` / `release`，每个 lease 带有明确的过期时间（`expires_at`）
-- 同一资源任意时刻最多一个有效 lease；过期租约无法续期
-- 每次成功获取产生**严格递增的 fencing token**（全局单调计数器，持久化）
-- 所有时间逻辑通过可注入 `Clock` 接口，测试使用 `ManualClock`，零真实 sleep
-- 客户端暂停/恢复模拟（`pause()` / `resume()`），旧持有者恢复后被 fencing token 识别
-- 本地 JSON 文件持久化（原子写入），重启后过期 lease 不会被错误恢复
+- Python 3.10+，依赖 `Pillow` 与 `numpy`，测试使用 `pytest`。
 
-## 目录结构
+## 使用方法
 
-```
-lease_lock/
-  clock.py           # Clock 接口、SystemClock、ManualClock（可推进的测试时钟）
-  server.py          # LeaseServer：acquire / renew / release，状态机与持久化
-  client.py          # LeaseClient 与带后台续约线程的 AutoRenewClient
-  fenced_resource.py # 下游资源模拟：拒绝过期 fencing token 的写入
-  store.py           # MemoryStore / FileStore（原子 JSON 落盘）/ OpLog（JSONL 日志）
-  errors.py          # LeaseHeldError / LeaseNotHeldError / StaleFencingTokenError
-tests/
-  test_lease_lock.py # 17 个自动化测试
+```bash
+python -m tilepyramid build <输入图片> -o <输出目录> \
+    [--tile-size 256] [--min-size 256] \
+    [--resample nearest|bilinear] [--edge crop|pad]
 ```
 
-## Lease 状态机
-
-针对单个资源，租约处于以下状态之一：
+输出目录结构：
 
 ```
-                 acquire
-            ┌───────────────┐
-            ▼               │
-          FREE ──acquire──▶ HELD ──release──▶ FREE
-            ▲               │  ▲
-            │          renew│  │（延长 expires_at，token 不变）
-            │               ▼  │
-            │   clock.now() ≥ expires_at
-            └────── EXPIRED ◀──┘
-                 （推导状态，不落盘）
+<输出目录>/manifest.json
+<输出目录>/tiles/<level>/<x>_<y>.png
 ```
 
-- `EXPIRED` 不是存储字段，而是由 `clock.now() >= expires_at` 动态推导，
-  因此重启后只要时钟正确，过期租约自然失效，不会被“恢复”。
-- `renew` 要求 holder 与 token 同时匹配且租约未过期，否则抛 `LeaseNotHeldError`。
-- `release` 要求 token 匹配，旧持有者无法释放新持有者的租约。
+## 层级算法
 
-## Fencing 原理
+- 层级从 **0（最粗糙）** 编号到 **L（原图，全分辨率）**。
+- 每向下一层，宽高分别做 ceil 减半：`(n + 1) // 2`，奇数尺寸因此得到确定的处理。
+- 当某一层的宽和高都 `<= min_size` 时停止，该层即第 0 层。
+- 每一层都直接由原图按目标尺寸一次性缩放生成（而非逐级迭代缩放），
+  避免累积误差，保证相同输入得到稳定（逐字节一致）的结果。
+- 缩放支持 `nearest` 与 `bilinear` 两种，均基于像素中心约定用 float64 实现，
+  结果确定可复现。
 
-锁服务内部维护一个**全局单调递增计数器**，每次 `acquire` 成功：
+## 坐标与边缘规则
 
-1. 计数器 +1，作为新 lease 的 `token`；
-2. 计数器随状态一起持久化，重启后继续递增，绝不回退。
+- tile 坐标 `(x, y)` 为层级内的列、行索引（从 0 开始），像素原点为该层左上角，
+  tile 覆盖 `[x*tile_size, (x+1)*tile_size) × [y*tile_size, (y+1)*tile_size)`。
+- 边缘不足一个完整 tile 的区域由 `--edge` 决定：
+  - `crop`（默认）：边缘 tile 按实际尺寸裁剪保存（宽/高小于 tile_size）；
+  - `pad`：边缘 tile 用 `pad_color`（默认黑色）补齐到完整 tile_size。
+- 所有 tile 一律输出为无损 PNG，保证哈希稳定。
 
-客户端操作下游资源时携带自己的 token。下游资源（`FencedResource`）记录已见
-最大 token，拒绝任何 `token <= last_seen` 的写入。因此即使旧持有者在暂停后
-恢复、仍误以为自己持有锁，它的写入也会被下游拒绝——这就是 fencing：
+## manifest
 
-```
-client A: acquire → token=3 ──暂停──▶ 恢复后 write(token=3) ✗ 被拒绝
-client B:            acquire → token=4, write(token=4) ✓ 成功（last_seen=4）
-```
+`manifest.json` 记录校验与增量重建所需的全部信息：
 
-## 时间模型
+- `source`：原图文件名、尺寸、SHA-256；
+- `config`：tile_size、min_size、resample、edge、pad_color；
+- `levels[]`：每层的 `level`、宽高、`scale`（相对第 0 层的放大倍数）及 `tiles[]`；
+- `tiles[]`：每个 tile 的坐标 `(x, y)`、文件路径、实际尺寸和文件 SHA-256。
 
-- 服务端**只**通过注入的 `Clock.now()` 读取时间，从不直接调用 `time`。
-- 生产环境使用 `SystemClock`（`time.monotonic`）。
-- 测试使用 `ManualClock`：时间只能通过 `advance(seconds)` 前进，单调、线程安全；
-  `ManualClock.sleep()` 供自动续约线程按虚拟时间阻塞，全部测试无任何真实 sleep。
+## 增量重建与原子写入
 
-## 持久化与重启
-
-- `FileStore` 将 `{fencing_token, leases}` 以 JSON 原子写入本地文件
-  （tmp 文件 + `os.replace`），崩溃不会产生半截状态。
-- 重启时加载持久化状态：fencing 计数器继续递增；lease 是否有效完全由
-  `expires_at` 与当前时钟比较决定，**过期 lease 不会被错误恢复**。
-- `OpLog` 以 JSONL 追加方式把 acquire/renew/release 及拒绝事件写入本地日志文件。
+- 重建时比对 manifest 中的源图哈希与配置：一致则逐个校验 tile 文件的 SHA-256，
+  未变化的 tile 直接复用，**损坏或缺失的 tile 只重新生成对应文件**；
+  源图或配置变化则整体重建，并清理不再被引用的旧 tile。
+- 所有文件（tile 与 manifest）都先写入同目录临时文件，再用 `os.replace` 原子替换；
+  manifest 最后写入，因此生成中断不会留下被 manifest 误认为有效的半文件。
+  下次构建开始时自动清理残留的临时文件。
 
 ## 运行测试
 
 ```bash
-cd /mnt2/zjh/code/Goleta/session_70/b
-python3 -m pytest tests/ -v
+python -m pytest tests/ -v
 ```
 
-测试覆盖：竞争获取（16 线程仅 1 胜者）、续约延长、租约超时后不可续期、
-客户端暂停超过 lease 后恢复（fencing 识别）、token 单调性、释放后重获、
-过期 token 无法释放他人租约、重启后有效 lease 保留 / 过期 lease 不恢复等 17 个场景。
-
-## 快速示例
-
-```python
-from lease_lock import FileStore, LeaseClient, LeaseServer, ManualClock
-
-clock = ManualClock()
-server = LeaseServer(clock, FileStore("state.json"))
-a, b = LeaseClient(server, "a", ttl=10), LeaseClient(server, "b", ttl=10)
-
-lease_a = a.acquire("order-db")        # token=1
-clock.advance(11)                      # a 暂停超过 lease
-lease_b = b.acquire("order-db")        # token=2，b 成为新持有者
-a.renew("order-db")                    # 抛 LeaseNotHeldError：旧租约已过期
-```
+测试在终端内生成小型测试图像并输出校验结果，不会打开任何图片窗口。覆盖场景：
+奇数尺寸、边缘 tile（crop/pad）、nearest 与 bilinear 两种缩放及其稳定性、
+增量重建、tile 损坏/缺失后的重新生成、源图变化后的整体重建、
+中途失败（崩溃后不产生有效 manifest、可恢复重建）以及 JPEG 输入。
